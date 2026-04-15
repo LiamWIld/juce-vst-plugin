@@ -1,0 +1,15 @@
+.idea/
+.vs/
+.vscode/
+
+build/
+cmake-build-*/
+CMakeUserPresets.json
+
+out/
+bin/
+
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
