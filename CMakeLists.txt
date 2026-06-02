@@ -4,13 +4,19 @@ set(CMAKE_CXX_STANDARD 17)
 
 add_subdirectory(JUCE)
 
+juce_add_binary_data(Tascam424BinaryData
+    SOURCES
+        SimData/u101a_transfer_lut.csv
+)
+
 juce_add_plugin(Tascam424Plugin
-    PLUGIN_NAME             "Tascam424"
-    PRODUCT_NAME            "Tascam424"
-    COMPANY_NAME            "YourName"
-    PLUGIN_MANUFACTURER_CODE Tsc4
-    PLUGIN_CODE             T424
-    FORMATS                 VST3 Standalone
+    PLUGIN_NAME             "fourtwofour"
+    PRODUCT_NAME            "fourtwofour"
+    COMPANY_NAME            "wildli"
+    BUNDLE_ID               "com.wildli.fourtwofour"
+    PLUGIN_MANUFACTURER_CODE Wldi
+    PLUGIN_CODE             F424
+    FORMATS                 VST3 AU Standalone
     VST3_AUTO_MANIFEST      TRUE
     IS_SYNTH                FALSE
     NEEDS_MIDI_INPUT        FALSE
@@ -32,6 +38,7 @@ target_compile_definitions(Tascam424Plugin PUBLIC
 )
 
 target_link_libraries(Tascam424Plugin PRIVATE
+    Tascam424BinaryData
     juce::juce_audio_utils
     juce::juce_audio_processors
     juce::juce_dsp

@@ -1,6 +1,8 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "BinaryData.h"
 
+#include <algorithm>
 #include <cmath>
 
 Tascam424AudioProcessor::Tascam424AudioProcessor()
@@ -8,9 +10,16 @@ Tascam424AudioProcessor::Tascam424AudioProcessor()
                                          .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       apvts(*this, nullptr, "Parameters", createParameters())
 {
+    loadTransferTableFromCsv();
+    apvts.addParameterListener("GAIN1", this);
+    apvts.addParameterListener("AUTO_LEVEL", this);
 }
 
-Tascam424AudioProcessor::~Tascam424AudioProcessor() = default;
+Tascam424AudioProcessor::~Tascam424AudioProcessor()
+{
+    apvts.removeParameterListener("GAIN1", this);
+    apvts.removeParameterListener("AUTO_LEVEL", this);
+}
 
 const juce::String Tascam424AudioProcessor::getName() const
 {
@@ -74,22 +83,57 @@ void Tascam424AudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
 
     for (int ch = 0; ch < 2; ++ch)
     {
+        inputCouplingHPF[ch].reset();
         preEmphasisFilter[ch].reset();
         deEmphasisFilter[ch].reset();
         eqLowFilter[ch].reset();
         eqHighFilter[ch].reset();
 
+        inputCouplingHPF[ch].prepare(spec);
         preEmphasisFilter[ch].prepare(spec);
         deEmphasisFilter[ch].prepare(spec);
         eqLowFilter[ch].prepare(spec);
         eqHighFilter[ch].prepare(spec);
     }
 
+    if (!mTableLoaded)
+        loadTransferTableFromCsv();
+
     updateFilterCoefficients();
 }
 
 void Tascam424AudioProcessor::releaseResources()
 {
+}
+
+void Tascam424AudioProcessor::parameterChanged(const juce::String& parameterID, float newValue)
+{
+    if (mUpdatingOutputFromAutoLevel)
+        return;
+
+    if (parameterID == "GAIN1")
+    {
+        if (apvts.getRawParameterValue("AUTO_LEVEL")->load() >= 0.5f)
+            updateAutoLevelOutput(newValue);
+    }
+    else if (parameterID == "AUTO_LEVEL" && newValue >= 0.5f)
+    {
+        updateAutoLevelOutput(apvts.getRawParameterValue("GAIN1")->load());
+    }
+}
+
+void Tascam424AudioProcessor::updateAutoLevelOutput(float gain)
+{
+    auto* outputParam = apvts.getParameter("GAIN2");
+    if (outputParam == nullptr)
+        return;
+
+    const float output = juce::jlimit(0.0f, 10.0f, 10.0f - (gain * 0.625f));
+    const float normalisedOutput = outputParam->convertTo0to1(output);
+
+    mUpdatingOutputFromAutoLevel = true;
+    outputParam->setValueNotifyingHost(normalisedOutput);
+    mUpdatingOutputFromAutoLevel = false;
 }
 
 #ifndef JucePlugin_PreferredChannelConfigurations
@@ -108,144 +152,143 @@ bool Tascam424AudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts)
 
 void Tascam424AudioProcessor::updateFilterCoefficients()
 {
-    // C102 pre-emphasis: high shelf boost at 3.4kHz before waveshaper
-    // Models feedback loop weakening above 3.4kHz in U101a
-    // Boost amount scales with GAIN1 - harder drive = more high freq emphasis
-    const float gain1 = apvts.getRawParameterValue("GAIN1")->load();
-    const float preEmphasisGaindB = gain1 * 2.0f;
-
-    auto preEmphCoeffs = juce::dsp::IIR::Coefficients<float>::makeHighShelf(
-        currentSampleRate, 3400.0f, 0.707f,
-        juce::Decibels::decibelsToGain(preEmphasisGaindB));
-
-    // De-emphasis: exact inverse of pre-emphasis to restore balance
-    auto deEmphCoeffs = juce::dsp::IIR::Coefficients<float>::makeHighShelf(
-        currentSampleRate, 3400.0f, 0.707f,
-        juce::Decibels::decibelsToGain(-preEmphasisGaindB));
-
-    // EQ LOW: low shelf at 100Hz
-    // Component values from schematic: R108 100k, C106 0.015uF
-    const float eqLowGaindB = apvts.getRawParameterValue("EQ_LOW")->load();
-    auto eqLowCoeffs = juce::dsp::IIR::Coefficients<float>::makeLowShelf(
-        currentSampleRate, 100.0f, 0.707f,
-        juce::Decibels::decibelsToGain(eqLowGaindB));
-
-    // EQ HIGH: high shelf at 10kHz
-    // Component values from schematic: R107 100k, C105 0.0018uF
-    const float eqHighGaindB = apvts.getRawParameterValue("EQ_HIGH")->load();
-    auto eqHighCoeffs = juce::dsp::IIR::Coefficients<float>::makeHighShelf(
-        currentSampleRate, 10000.0f, 0.707f,
-        juce::Decibels::decibelsToGain(eqHighGaindB));
+    // AC-coupled input behavior before the preamp transfer stage.
+    auto inputCouplingCoeffs = juce::dsp::IIR::Coefficients<float>::makeHighPass(
+        currentSampleRate, 20.0f, 0.707f);
 
     for (int ch = 0; ch < 2; ++ch)
-    {
-        preEmphasisFilter[ch].coefficients = preEmphCoeffs;
-        deEmphasisFilter[ch].coefficients = deEmphCoeffs;
-        eqLowFilter[ch].coefficients = eqLowCoeffs;
-        eqHighFilter[ch].coefficients = eqHighCoeffs;
-    }
+        inputCouplingHPF[ch].coefficients = inputCouplingCoeffs;
 }
 
-float Tascam424AudioProcessor::saturate(float x, float gain1)
+float Tascam424AudioProcessor::saturate(float x, float gain)
 {
-    // Map gain1 (0-10) to actual voltage gain of U101a
-    // Real circuit: Gain = Rf/Rin = 470k / 10k = 47x at max TRIM
-    // We scale smoothly from 1x (clean) to 47x (full saturation)
-    const float voltageGain = 1.0f + gain1 * 4.6f;
+    // Fallback curve used only when the embedded LTspice LUT is unavailable.
+    const float voltageGain = std::pow(47.0f, gain / 10.0f);
 
-    // Phase inversion - U101a is an inverting amplifier
     const float inverted = -x * voltageGain;
 
-    // Asymmetric tanh - NPN UPC4570 clips positive and negative
-    // half cycles differently
     float shaped;
     if (inverted > 0.0f)
         shaped = std::tanh(inverted * 1.0f);
     else
         shaped = std::tanh(inverted * 1.2f);
 
-    // Output compensation - maintain consistent perceived loudness
-    const float compensation = 1.0f / (1.0f + gain1 * 0.15f);
+    const float compensation = 1.0f / (1.0f + gain * 0.15f);
     return shaped * compensation;
 }
 
 void Tascam424AudioProcessor::loadTransferTable(const std::vector<std::pair<float, float>>& spiceData)
 {
-    // spiceData is a vector of (inputVoltage, outputVoltage) pairs
-    // from an LTspice DC sweep of the 2SD1450 input stage.
-    // We normalise the input range to +-1 and map it to table indices.
-    if (spiceData.empty())
+    if (spiceData.size() < 2)
         return;
 
-    const float vMin = spiceData.front().first;
-    const float vMax = spiceData.back().first;
-    const float vRange = vMax - vMin;
+    const float inMin = spiceData.front().first;
+    const float inMax = spiceData.back().first;
+    const float inRange = inMax - inMin;
 
-    // Find output min/max for normalisation
-    const float outMin = spiceData.front().second;
-    const float outMax = spiceData.back().second;
-    const float outRange = outMax - outMin;
-
-    if (vRange == 0.0f || outRange == 0.0f || spiceData.size() < 2)
+    if (inRange <= 0.0f)
         return;
+
+    std::size_t sourceIndex = 0;
 
     for (int i = 0; i < kTableSize; ++i)
     {
-        // Map table index to input voltage
-        const float v = vMin + (static_cast<float>(i) / static_cast<float>(kTableSize - 1)) * vRange;
+        const float input = -1.0f + 2.0f * static_cast<float>(i) / static_cast<float>(kTableSize - 1);
 
-        // Linear interpolation into spice data
-        float normV = (v - vMin) / vRange * static_cast<float>(spiceData.size() - 1);
-        int idx = static_cast<int>(normV);
-        const float frac = normV - static_cast<float>(idx);
-        idx = juce::jlimit(0, static_cast<int>(spiceData.size()) - 2, idx);
+        while (sourceIndex + 2 < spiceData.size()
+               && spiceData[sourceIndex + 1].first < input)
+        {
+            ++sourceIndex;
+        }
 
-        const float out = spiceData[static_cast<std::size_t>(idx)].second
-                        + frac * (spiceData[static_cast<std::size_t>(idx + 1)].second
-                                  - spiceData[static_cast<std::size_t>(idx)].second);
+        const auto& a = spiceData[sourceIndex];
+        const auto& b = spiceData[std::min(sourceIndex + 1, spiceData.size() - 1)];
+        const float range = b.first - a.first;
+        const float frac = range > 0.0f ? juce::jlimit(0.0f, 1.0f, (input - a.first) / range) : 0.0f;
+        const float output = a.second + frac * (b.second - a.second);
 
-        // Normalise output to +-1 range
-        mTransferTable[static_cast<std::size_t>(i)] = (out - outMin) / outRange * 2.0f - 1.0f;
+        mTransferTable[static_cast<std::size_t>(i)] = juce::jlimit(-1.0f, 1.0f, output);
     }
 
     mTableLoaded = true;
 }
 
-float Tascam424AudioProcessor::saturateLUT(float x, float gain1) const
+bool Tascam424AudioProcessor::loadTransferTableFromCsv()
+{
+    if (BinaryData::u101a_transfer_lut_csv == nullptr || BinaryData::u101a_transfer_lut_csvSize <= 0)
+    {
+        DBG("fourtwofour: embedded LUT missing");
+        return false;
+    }
+
+    juce::StringArray lines;
+    lines.addLines(juce::String::fromUTF8(BinaryData::u101a_transfer_lut_csv,
+                                          BinaryData::u101a_transfer_lut_csvSize));
+
+    std::vector<std::pair<float, float>> points;
+    points.reserve(static_cast<std::size_t>(lines.size()));
+
+    for (const auto& rawLine : lines)
+    {
+        const auto line = rawLine.trim();
+
+        if (line.isEmpty() || line.startsWithIgnoreCase("input_norm"))
+            continue;
+
+        const auto comma = line.indexOfChar(',');
+        if (comma < 0)
+            continue;
+
+        const float input = line.substring(0, comma).trim().getFloatValue();
+        const float output = line.substring(comma + 1).trim().getFloatValue();
+
+        points.emplace_back(juce::jlimit(-1.0f, 1.0f, input),
+                            juce::jlimit(-1.0f, 1.0f, output));
+    }
+
+    if (points.size() < 2)
+    {
+        DBG("fourtwofour: embedded LUT parse failed (" << points.size() << " points)");
+        return false;
+    }
+
+    loadTransferTable(points);
+
+    if (!mTableLoaded)
+        DBG("fourtwofour: embedded LUT load failed (" << points.size() << " points)");
+
+    return mTableLoaded;
+}
+
+float Tascam424AudioProcessor::saturateLUT(float x, float gain) const
 {
     if (!mTableLoaded)
-        return saturate(x, gain1); // fall back to tanh if no table loaded
+        return saturate(x, gain);
 
-    const float driveGain = std::exp(gain1 * 0.5f);
+    // Gain sets drive into the U101A transfer curve generated from LTspice.
+    const float driveGain = std::pow(47.0f, gain / 10.0f);
     const float input = juce::jlimit(-1.0f, 1.0f, x * driveGain);
 
-    // Map +-1 input range to table index
     float normInput = (input + 1.0f) * 0.5f * static_cast<float>(kTableSize - 1);
     int idx = static_cast<int>(normInput);
     const float frac = normInput - static_cast<float>(idx);
     idx = juce::jlimit(0, kTableSize - 2, idx);
 
-    // Linear interpolation between adjacent table entries
     const float out = mTransferTable[static_cast<std::size_t>(idx)]
                     + frac * (mTransferTable[static_cast<std::size_t>(idx + 1)]
                               - mTransferTable[static_cast<std::size_t>(idx)]);
 
-    // Output compensation
-    return out / std::tanh(driveGain);
+    const float compensation = 1.0f / (1.0f + gain * 0.15f);
+    return out * compensation;
 }
 
 void Tascam424AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
 
-    // Read parameters
-    const float gain1 = apvts.getRawParameterValue("GAIN1")->load();
-    const float gain2 = juce::Decibels::decibelsToGain(
-        apvts.getRawParameterValue("GAIN2")->load());
+    const float gain = apvts.getRawParameterValue("GAIN1")->load();
+    const float output = apvts.getRawParameterValue("GAIN2")->load() / 10.0f;
 
-    // Update filter coefficients if parameters changed
-    // Note: in production move this to a parameter listener
-    // to avoid calling every block
     updateFilterCoefficients();
 
     const auto totalNumInputChannels = getTotalNumInputChannels();
@@ -263,23 +306,14 @@ void Tascam424AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         {
             float x = channelData[sample];
 
-            // STAGE 1: Pre-emphasis (C102 frequency-dependent saturation)
-            x = preEmphasisFilter[ch].processSample(x);
+            // AC-coupled input behavior before the preamp transfer stage.
+            x = inputCouplingHPF[ch].processSample(x);
 
-            // STAGE 2: UPC4570 saturation (U101a)
-            x = mTableLoaded ? saturateLUT(x, gain1) : saturate(x, gain1);
+            // U101A transfer curve generated from the LTspice simulation.
+            x = mTableLoaded ? saturateLUT(x, gain) : saturate(x, gain);
 
-            // STAGE 3: De-emphasis (restore frequency balance)
-            x = deEmphasisFilter[ch].processSample(x);
-
-            // STAGE 4: EQ LOW shelf (U102b - 100Hz)
-            x = eqLowFilter[ch].processSample(x);
-
-            // STAGE 5: EQ HIGH shelf (U102b - 10kHz)
-            x = eqHighFilter[ch].processSample(x);
-
-            // STAGE 6: GAIN2 channel fader
-            x *= gain2;
+            // Final output trim.
+            x *= output;
 
             channelData[sample] = x;
         }
@@ -318,31 +352,19 @@ juce::AudioProcessorValueTreeState::ParameterLayout Tascam424AudioProcessor::cre
 {
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
 
-    // GAIN1: controls U101a closed-loop gain
-    // 0 = minimum gain (clean), 10 = maximum gain (heavy saturation)
-    // Maps to real TRIM pot range of the feedback network
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID("GAIN1", 1), "Gain 1",
         juce::NormalisableRange<float>(0.0f, 10.0f, 0.01f),
         3.0f));
 
-    // GAIN2: channel fader output level +/-20dB
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("GAIN2", 1), "Gain 2",
-        juce::NormalisableRange<float>(-20.0f, 20.0f, 0.1f),
-        0.0f));
+        juce::ParameterID("GAIN2", 1), "Output",
+        juce::NormalisableRange<float>(0.0f, 10.0f, 0.01f),
+        10.0f));
 
-    // EQ LOW: 100Hz shelving filter +/-10dB
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("EQ_LOW", 1), "Bass",
-        juce::NormalisableRange<float>(-10.0f, 10.0f, 0.1f),
-        0.0f));
-
-    // EQ HIGH: 10kHz shelving filter +/-10dB
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("EQ_HIGH", 1), "Treble",
-        juce::NormalisableRange<float>(-10.0f, 10.0f, 0.1f),
-        0.0f));
+    params.push_back(std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID("AUTO_LEVEL", 1), "Auto Level",
+        false));
 
     return { params.begin(), params.end() };
 }

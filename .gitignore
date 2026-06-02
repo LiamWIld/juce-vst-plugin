@@ -13,3 +13,22 @@ bin/
 *.suo
 *.VC.db
 *.VC.opendb
+
+SimData/.idea/
+SimData/.venv/
+SimData/__pycache__/
+
+# Keep the bundled tester-build LUT in source control.
+!SimData/u101a_transfer_lut.csv
+
+# Ignore LTspice projects/models and generated simulation exports.
+SimData/*.asc
+SimData/*.asy
+SimData/*.lib
+SimData/*.raw
+SimData/*.log
+SimData/*.net
+SimData/*.op.raw
+SimData/*.plt
+SimData/*.txt
+SimData/*.png
